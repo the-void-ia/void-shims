@@ -19,6 +19,8 @@ pub enum ShimError {
     CommandFailed(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("yaml parse: {0}")]
+    Yaml(#[from] serde_yaml::Error),
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 }
@@ -31,9 +33,7 @@ pub fn load_spec_for_shim(path: &std::path::Path) -> Result<RunSpec, ShimError> 
 /// Parse a void-box RunSpec from a YAML string without running validation.
 /// Use in tests; production callers must use `load_spec_for_shim`.
 pub fn parse_spec_str(s: &str) -> Result<RunSpec, ShimError> {
-    serde_yaml::from_str(s).map_err(|e| {
-        ShimError::VoidBox(void_box::Error::Config(format!("yaml parse: {e}")))
-    })
+    Ok(serde_yaml::from_str(s)?)
 }
 
 #[cfg(test)]
@@ -77,6 +77,6 @@ workflow:
     #[test]
     fn rejects_malformed_yaml() {
         let err = parse_spec_str("not: : valid: yaml::").expect_err("malformed yaml fails");
-        assert!(matches!(err, ShimError::VoidBox(_)));
+        assert!(matches!(err, ShimError::Yaml(_)));
     }
 }
