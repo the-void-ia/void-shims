@@ -472,6 +472,10 @@ fn render_job_yaml(
     spec: &RunSpec,
     run_id: uuid::Uuid,
 ) -> Result<String, ShimError> {
+    validate_yaml_scalar(namespace, "namespace")?;
+    validate_yaml_scalar(&options.image, "image")?;
+    validate_yaml_scalar(&options.image_pull_policy, "image_pull_policy")?;
+
     let run_yaml = serde_yaml::to_string(spec)?;
     let run_yaml_b64 = BASE64_STANDARD.encode(run_yaml.as_bytes());
 
@@ -588,6 +592,20 @@ fn validate_mount_host(host: &str) -> Result<(), ShimError> {
     if !host.starts_with('/') {
         return Err(ShimError::InvalidMount(format!(
             "mount host path must be absolute, got: {host}"
+        )));
+    }
+    if host.contains('\n') || host.contains('\r') {
+        return Err(ShimError::InvalidMount(format!(
+            "mount host path must not contain newlines, got: {host:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_yaml_scalar(value: &str, field: &str) -> Result<(), ShimError> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(ShimError::InvalidMount(format!(
+            "{field} must not contain newlines, got: {value:?}"
         )));
     }
     Ok(())
@@ -720,6 +738,23 @@ agent: {{ prompt: "hi", timeout_secs: 5 }}
             .expect("render ok");
         assert!(yaml.contains("/dev/kvm"), "expected /dev/kvm mount; got:\n{yaml}");
         assert!(yaml.contains("privileged: true"), "expected privileged: true; got:\n{yaml}");
+    }
+
+    #[test]
+    fn render_includes_kvm_for_mode_auto() {
+        let spec = sample_agent_spec("auto");
+        let yaml = render_job_yaml("default", "j", &default_opts(), &spec, uuid::Uuid::nil())
+            .expect("render ok");
+        assert!(yaml.contains("/dev/kvm"), "expected /dev/kvm for mode=auto; got:\n{yaml}");
+        assert!(yaml.contains("privileged: true"), "expected privileged for mode=auto; got:\n{yaml}");
+    }
+
+    #[test]
+    fn render_rejects_namespace_with_newline() {
+        let spec = sample_agent_spec("mock");
+        let err = render_job_yaml("ns\ninject", "j", &default_opts(), &spec, uuid::Uuid::nil())
+            .expect_err("newline in namespace should fail");
+        assert!(matches!(err, ShimError::InvalidMount(_)), "got {err:?}");
     }
 
     #[test]
