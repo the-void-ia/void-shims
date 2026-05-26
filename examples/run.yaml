@@ -1,0 +1,12 @@
+api_version: v1
+kind: agent
+name: smoke-test
+sandbox:
+  mode: mock
+  memory_mb: 512
+  vcpus: 1
+llm:
+  provider: claude
+agent:
+  prompt: "Say exactly: hello from shim-k8s. Then stop."
+  timeout_secs: 60
