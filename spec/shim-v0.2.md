@@ -129,8 +129,9 @@ must be enforced strictly.
 
 ## 9. Repository Layout (Mono-repo Recommended)
 
-void-shims/ ├── spec/ │ └── shim-v0.1.md ├── crates/ │ ├── shim-core/ │
-├── shim-k8s/ │ ├── shim-containerd/ │ └── shim-libvirt/ └── README.md
+void-shims/ ├── spec/ │ └── shim-v0.2.md ├── crates/ │ ├── shim-core/ │
+├── shim-k8s/ │ ├── shim-containerd/ │ └── shim-libvirt/ ├── scripts/ │ └──
+kind_smoke.sh └── README.md
 
 ------------------------------------------------------------------------
 
@@ -156,8 +157,10 @@ shell-less images by allowing explicit command/args execution mode.
 
 ### 11.3 Mount Translation
 
-`RunSpec.mounts` should be mapped to Kubernetes volumes/volumeMounts
-with strict validation and no silent fallback.
+Done in v0.2: `sandbox.mounts[]` is rendered as paired k8s `volumes` +
+`volumeMounts` with strict validation (absolute host paths only, no
+newlines). `--mount-strategy emptyDir` overrides the default `hostPath`
+for ephemeral pod-local storage.
 
 ### 11.4 Observability
 
@@ -166,12 +169,9 @@ errors, container termination reason, and exit code when available).
 
 ### 11.5 Repeatable Validation
 
-Add a scripted Minikube smoke workflow for:
-
-- run
-- status transition to terminal state
-- logs retrieval
-- cleanup
+Done in v0.2: `scripts/kind_smoke.sh` exercises render → dry-run apply →
+(optionally) run → status loop → logs → rm against a local `kind` cluster.
+CI integration tracked separately in §11.7.
 
 ### 11.6 agent-sandbox CRD Backend
 

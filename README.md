@@ -8,7 +8,7 @@ Integration shims for running **Void-Box** on existing orchestrators.
 
 ## Spec
 
-See: `spec/shim-v0.1.md`
+See: `spec/shim-v0.2.md`
 
 ## Workspace
 
@@ -62,7 +62,8 @@ Set `SHIM_IMAGE=<other-image>` to override the container image.
 ## Notes
 
 - Shims are for *integrations*, not a replacement for `void-control`.
-- Shims enforce the **workflow_per_vm** execution profile.
+- Each `voidbox run` invocation already executes one microVM per RunSpec; the
+  shim does not enforce an isolation profile.
 
 ## Next Steps
 
