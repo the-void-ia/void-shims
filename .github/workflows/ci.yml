@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # void-shims depends on void-box via a path dep. Clone it into a
+          # sibling location so cargo can resolve `../../../agent-infra/void-box`.
+          path: void-shims
+
+      - name: Checkout void-box (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: the-void-ia/void-box
+          path: agent-infra/void-box
+          ref: v0.2.0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: void-shims
+
+      - name: Build workspace
+        working-directory: void-shims
+        run: cargo build --workspace
+
+      - name: Run tests
+        working-directory: void-shims
+        run: cargo test --workspace --verbose
+
+      - name: Doc tests
+        working-directory: void-shims
+        run: cargo test --doc --workspace
+
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: void-shims
+
+      - name: Checkout void-box (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: the-void-ia/void-box
+          path: agent-infra/void-box
+          ref: v0.2.0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: void-shims
+          shared-key: lint
+
+      - name: cargo fmt --check
+        working-directory: void-shims
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        working-directory: void-shims
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: void-shims
+
+      - name: Checkout void-box (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: the-void-ia/void-box
+          path: agent-infra/void-box
+          ref: v0.2.0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: void-shims
+          shared-key: docs
+
+      - name: cargo doc
+        working-directory: void-shims
+        run: cargo doc --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings

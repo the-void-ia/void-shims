@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/shim-core",
+  "crates/shim-k8s",
+  "crates/shim-containerd",
+  "crates/shim-libvirt",
+]

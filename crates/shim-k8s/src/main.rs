@@ -8,6 +8,12 @@ use std::process::{Command as ProcessCommand, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 
+mod client;
+mod crd_check;
+mod llm_creds;
+mod portforward;
+mod render_sandbox;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "void-shim-k8s",
@@ -30,6 +36,20 @@ enum MountKvmOverride {
 enum MountStrategy {
     HostPath,
     EmptyDir,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum BackendArg {
+    Auto,
+    Job,
+    Sandbox,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum EndpointMode {
+    Auto,
+    InCluster,
+    PortForward,
 }
 
 #[derive(Subcommand, Debug)]
@@ -60,6 +80,9 @@ enum Command {
         /// Command executed after writing /spec/run.yaml.
         #[arg(long, default_value = "voidbox run --file /spec/run.yaml")]
         command: String,
+        /// Force backend selection. `auto` derives from spec.
+        #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
+        backend: BackendArg,
     },
 
     /// Apply a Job to the cluster and print run_ref (namespace/job_name).
@@ -88,6 +111,9 @@ enum Command {
         /// Command executed after writing /spec/run.yaml.
         #[arg(long, default_value = "voidbox run --file /spec/run.yaml")]
         command: String,
+        /// Force backend selection. `auto` derives from spec.
+        #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
+        backend: BackendArg,
     },
 
     /// Get status of a run_ref in the form namespace/job_name.
@@ -100,12 +126,52 @@ enum Command {
         follow: bool,
     },
 
-    /// Remove a run by deleting the backing Job.
+    /// Remove a run by deleting the backing Job or Sandbox CR.
     Rm {
         run_ref: String,
         #[arg(long)]
         force: bool,
     },
+
+    /// Send a message to a running service-mode agent.
+    Send {
+        run_ref: String,
+        #[arg(long, conflicts_with = "message_file")]
+        message: Option<String>,
+        #[arg(long, conflicts_with = "message")]
+        message_file: Option<PathBuf>,
+        #[arg(long, default_value = "user")]
+        role: String,
+        #[arg(long, value_enum, default_value_t = EndpointMode::Auto)]
+        endpoint_mode: EndpointMode,
+    },
+
+    /// Cancel a running service-mode agent.
+    Cancel {
+        run_ref: String,
+        #[arg(long, value_enum, default_value_t = EndpointMode::Auto)]
+        endpoint_mode: EndpointMode,
+    },
+
+    /// Fetch a telemetry snapshot from a running service-mode agent.
+    Telemetry {
+        run_ref: String,
+        #[arg(long, value_enum, default_value_t = EndpointMode::Auto)]
+        endpoint_mode: EndpointMode,
+    },
+
+    /// Print connection info (URL, token, sample curl) for a sandbox run_ref.
+    Endpoint {
+        run_ref: String,
+        #[arg(long, value_enum, default_value_t = EndpointMode::Auto)]
+        endpoint_mode: EndpointMode,
+    },
+
+    /// Suspend a sandbox by scaling its replicas to 0.
+    Suspend { run_ref: String },
+
+    /// Resume a sandbox by scaling its replicas to 1.
+    Resume { run_ref: String },
 }
 
 fn main() -> Result<(), ShimError> {
@@ -121,20 +187,46 @@ fn main() -> Result<(), ShimError> {
             mount_kvm_override,
             mount_strategy,
             command,
+            backend,
         } => {
             let spec = shim_core::load_spec_for_shim(&file)?;
             let run_id = uuid::Uuid::new_v4();
             let name_part = normalize_dns1123_label(&spec.name, 30);
-            let job_name = format!("{}-{}-{}", normalize_dns1123_label(&name_prefix, 20), name_part, short(run_id));
-            let opts = RenderOptions {
-                image,
-                image_pull_policy,
-                mount_kvm_override,
-                mount_strategy,
-                runtime_command: command,
-            };
-            let yaml = render_job_yaml(&namespace, &job_name, &opts, &spec, run_id)?;
-            print!("{}", yaml);
+            let job_name = format!(
+                "{}-{}-{}",
+                normalize_dns1123_label(&name_prefix, 20),
+                name_part,
+                short(run_id)
+            );
+
+            let chosen = resolve_backend_choice(backend, &spec)?;
+            match chosen {
+                shim_core::Backend::Job => {
+                    let opts = RenderOptions {
+                        image,
+                        image_pull_policy,
+                        mount_kvm_override,
+                        mount_strategy,
+                        runtime_command: command,
+                    };
+                    let yaml = render_job_yaml(&namespace, &job_name, &opts, &spec, run_id)?;
+                    print!("{}", yaml);
+                }
+                shim_core::Backend::Sandbox => {
+                    let opts = render_sandbox::SandboxRenderOptions {
+                        image,
+                        image_pull_policy,
+                        mount_kvm: derive_kvm_for_sandbox(mount_kvm_override, &spec),
+                        runtime_command_args: vec!["serve-and-load".into()],
+                        llm_credential: llm_creds::resolve_llm_credential(&spec, None),
+                    };
+                    let token = render_sandbox::generate_token();
+                    let yaml = render_sandbox::render_sandbox_yaml(
+                        &namespace, &job_name, &opts, &spec, run_id, &token,
+                    )?;
+                    print!("{}", yaml);
+                }
+            }
             Ok(())
         }
         Command::Run {
@@ -146,39 +238,178 @@ fn main() -> Result<(), ShimError> {
             mount_kvm_override,
             mount_strategy,
             command,
+            backend,
         } => {
             let spec = shim_core::load_spec_for_shim(&file)?;
             let run_id = uuid::Uuid::new_v4();
             let name_part = normalize_dns1123_label(&spec.name, 30);
-            let job_name = format!("{}-{}-{}", normalize_dns1123_label(&name_prefix, 20), name_part, short(run_id));
-            let opts = RenderOptions {
-                image,
-                image_pull_policy,
-                mount_kvm_override,
-                mount_strategy,
-                runtime_command: command,
-            };
-            let yaml = render_job_yaml(&namespace, &job_name, &opts, &spec, run_id)?;
-            kubectl_apply_yaml(&yaml)?;
-            println!("{namespace}/{job_name}");
+            let job_name = format!(
+                "{}-{}-{}",
+                normalize_dns1123_label(&name_prefix, 20),
+                name_part,
+                short(run_id)
+            );
+
+            let chosen = resolve_backend_choice(backend, &spec)?;
+            match chosen {
+                shim_core::Backend::Job => {
+                    let opts = RenderOptions {
+                        image,
+                        image_pull_policy,
+                        mount_kvm_override,
+                        mount_strategy,
+                        runtime_command: command,
+                    };
+                    let yaml = render_job_yaml(&namespace, &job_name, &opts, &spec, run_id)?;
+                    kubectl_apply_yaml(&yaml)?;
+                    println!("{namespace}/{job_name}");
+                }
+                shim_core::Backend::Sandbox => {
+                    crd_check::check_sandbox_crd_installed()?;
+                    let opts = render_sandbox::SandboxRenderOptions {
+                        image,
+                        image_pull_policy,
+                        mount_kvm: derive_kvm_for_sandbox(mount_kvm_override, &spec),
+                        runtime_command_args: vec!["serve-and-load".into()],
+                        llm_credential: llm_creds::resolve_llm_credential(&spec, None),
+                    };
+                    let token = render_sandbox::generate_token();
+                    let yaml = render_sandbox::render_sandbox_yaml(
+                        &namespace, &job_name, &opts, &spec, run_id, &token,
+                    )?;
+                    kubectl_apply_yaml(&yaml)?;
+                    println!("{namespace}/{job_name}");
+                }
+            }
             Ok(())
         }
         Command::Status { run_ref } => {
-            let (namespace, job_name) = parse_run_ref(&run_ref)?;
-            let status = get_job_status(&namespace, &job_name)?;
-            println!("{status}");
+            let (namespace, name) = parse_run_ref(&run_ref)?;
+            // Detect backend by querying both resources; Sandbox first.
+            if sandbox_exists(&namespace, &name) {
+                let status = get_sandbox_status(&namespace, &name)?;
+                println!("{status}");
+            } else {
+                let status = get_job_status(&namespace, &name)?;
+                println!("{status}");
+            }
             Ok(())
         }
         Command::Logs { run_ref, follow } => {
-            let (namespace, job_name) = parse_run_ref(&run_ref)?;
-            let pod = wait_for_job_pod(&namespace, &job_name, 10, Duration::from_secs(1))?;
+            let (namespace, name) = parse_run_ref(&run_ref)?;
+            // For Sandbox: pod has the same name as the CR. For Job: find pod
+            // by job-name label.
+            let pod = if sandbox_exists(&namespace, &name) {
+                name.clone()
+            } else {
+                wait_for_job_pod(&namespace, &name, 10, Duration::from_secs(1))?
+            };
             let args = build_logs_args(&namespace, &pod, follow);
             kubectl_stream(&args)
         }
         Command::Rm { run_ref, force } => {
-            let (namespace, job_name) = parse_run_ref(&run_ref)?;
-            let args = build_delete_job_args(&namespace, &job_name, force);
+            let (namespace, name) = parse_run_ref(&run_ref)?;
+            let sandbox_args = vec![
+                "delete".to_string(),
+                "sandbox".to_string(),
+                name.clone(),
+                "-n".to_string(),
+                namespace.clone(),
+            ];
+            if kubectl_output_owned(&sandbox_args).is_ok() {
+                return Ok(());
+            }
+            let args = build_delete_job_args(&namespace, &name, force);
             let _ = kubectl_output_owned(&args)?;
+            Ok(())
+        }
+        Command::Send {
+            run_ref,
+            message,
+            message_file,
+            role,
+            endpoint_mode,
+        } => {
+            let (namespace, sandbox_name) = parse_run_ref(&run_ref)?;
+            let content = match (message, message_file) {
+                (Some(m), _) => m,
+                (None, Some(p)) => std::fs::read_to_string(&p)?,
+                (None, None) => {
+                    return Err(ShimError::CommandFailed(
+                        "--message or --message-file required".into(),
+                    ));
+                }
+            };
+            let token = read_sandbox_token(&namespace, &sandbox_name)?;
+            let (endpoint, _pf) =
+                resolve_sandbox_endpoint(&namespace, &sandbox_name, endpoint_mode)?;
+            let dc = client::DaemonClient::new(endpoint, token, 30)?;
+            let voidbox_run_id = dc.first_run_id()?;
+            let body = dc.send_message(&voidbox_run_id, &role, &content)?;
+            println!("{body}");
+            Ok(())
+        }
+        Command::Cancel {
+            run_ref,
+            endpoint_mode,
+        } => {
+            let (namespace, sandbox_name) = parse_run_ref(&run_ref)?;
+            let token = read_sandbox_token(&namespace, &sandbox_name)?;
+            let (endpoint, _pf) =
+                resolve_sandbox_endpoint(&namespace, &sandbox_name, endpoint_mode)?;
+            let dc = client::DaemonClient::new(endpoint, token, 30)?;
+            let voidbox_run_id = dc.first_run_id()?;
+            let body = dc.cancel(&voidbox_run_id)?;
+            println!("{body}");
+            Ok(())
+        }
+        Command::Telemetry {
+            run_ref,
+            endpoint_mode,
+        } => {
+            let (namespace, sandbox_name) = parse_run_ref(&run_ref)?;
+            let token = read_sandbox_token(&namespace, &sandbox_name)?;
+            let (endpoint, _pf) =
+                resolve_sandbox_endpoint(&namespace, &sandbox_name, endpoint_mode)?;
+            let dc = client::DaemonClient::new(endpoint, token, 30)?;
+            let voidbox_run_id = dc.first_run_id()?;
+            let body = dc.telemetry(&voidbox_run_id)?;
+            println!("{body}");
+            Ok(())
+        }
+        Command::Endpoint {
+            run_ref,
+            endpoint_mode,
+        } => {
+            let (namespace, sandbox_name) = parse_run_ref(&run_ref)?;
+            let token = read_sandbox_token(&namespace, &sandbox_name)?;
+            let (endpoint, pf) =
+                resolve_sandbox_endpoint(&namespace, &sandbox_name, endpoint_mode)?;
+            println!("URL: {endpoint}");
+            println!("Token: {token}");
+            println!("Sample curl: curl -H 'Authorization: Bearer {token}' {endpoint}/v1/runs");
+            if pf.is_some() {
+                println!(
+                    "(port-forward will close when this command exits; press Ctrl-C to terminate)"
+                );
+                std::thread::park();
+            }
+            Ok(())
+        }
+        Command::Suspend { run_ref } => {
+            let (namespace, sandbox_name) = parse_run_ref(&run_ref)?;
+            let target = format!("sandbox/{sandbox_name}");
+            let args = ["scale", "-n", &namespace, &target, "--replicas=0"];
+            kubectl_output(&args)?;
+            println!("Suspended {run_ref}");
+            Ok(())
+        }
+        Command::Resume { run_ref } => {
+            let (namespace, sandbox_name) = parse_run_ref(&run_ref)?;
+            let target = format!("sandbox/{sandbox_name}");
+            let args = ["scale", "-n", &namespace, &target, "--replicas=1"];
+            kubectl_output(&args)?;
+            println!("Resumed {run_ref}");
             Ok(())
         }
     }
@@ -274,9 +505,11 @@ fn is_k8s_name(value: &str) -> bool {
         return false;
     }
 
+    // DNS-1123 label: lowercase alphanumerics + dash only. Both namespace
+    // and pod/job names are DNS-1123 labels (NOT subdomains), so '.' is invalid.
     value
         .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 fn get_job_status(namespace: &str, job_name: &str) -> Result<RunState, ShimError> {
@@ -285,6 +518,64 @@ fn get_job_status(namespace: &str, job_name: &str) -> Result<RunState, ShimError
     let job: JobResource = serde_json::from_slice(&output.stdout)
         .map_err(|e| ShimError::CommandFailed(format!("failed to parse job json: {e}")))?;
     Ok(map_job_to_state(job.status.as_ref()))
+}
+
+/// Returns true if a Sandbox CR with the given name exists in the namespace.
+fn sandbox_exists(namespace: &str, name: &str) -> bool {
+    let args = ["get", "sandbox", name, "-n", namespace, "-o", "name"];
+    kubectl_output(&args).is_ok()
+}
+
+/// Reads the Ready condition of a Sandbox CR and maps it to [`RunState`].
+fn get_sandbox_status(namespace: &str, name: &str) -> Result<RunState, ShimError> {
+    let args = [
+        "get",
+        "sandbox",
+        name,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}",
+    ];
+    let output = kubectl_output(&args)?;
+    let ready = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    match ready.as_str() {
+        "True" => Ok(RunState::Running),
+        "False" => Ok(RunState::Pending),
+        _ => Ok(RunState::Unknown),
+    }
+}
+
+/// Validates the user's `--backend` choice against the spec's detected backend.
+///
+/// - `auto` → detected backend (no error, no warning).
+/// - explicit + matches → use it.
+/// - `--backend sandbox` over non-service spec → fatal `BackendMismatch`.
+/// - `--backend job` over service spec → stderr warning, returns Job.
+fn resolve_backend_choice(
+    arg: BackendArg,
+    spec: &shim_core::RunSpec,
+) -> Result<shim_core::Backend, ShimError> {
+    let detected = shim_core::detect_backend(spec);
+    match (arg, detected) {
+        (BackendArg::Auto, b) => Ok(b),
+        (BackendArg::Job, _) => {
+            if detected == shim_core::Backend::Sandbox {
+                eprintln!(
+                    "WARN: rendering 'mode: service' spec as Job — service semantics \
+                     (send/telemetry/cancel routing) will not work; the daemon will run \
+                     but no client routing exists. Pass --backend auto or sandbox instead."
+                );
+            }
+            Ok(shim_core::Backend::Job)
+        }
+        (BackendArg::Sandbox, shim_core::Backend::Sandbox) => Ok(shim_core::Backend::Sandbox),
+        (BackendArg::Sandbox, shim_core::Backend::Job) => Err(ShimError::BackendMismatch(
+            spec.name.clone(),
+            "non-service spec".into(),
+            "sandbox backend requires kind:agent + mode:service".into(),
+        )),
+    }
 }
 
 fn map_job_to_state(status: Option<&JobStatus>) -> RunState {
@@ -473,8 +764,10 @@ fn render_job_yaml(
     run_id: uuid::Uuid,
 ) -> Result<String, ShimError> {
     validate_yaml_scalar(namespace, "namespace")?;
+    validate_yaml_scalar(job_name, "job_name")?;
     validate_yaml_scalar(&options.image, "image")?;
     validate_yaml_scalar(&options.image_pull_policy, "image_pull_policy")?;
+    validate_yaml_scalar(&options.runtime_command, "command")?;
 
     let run_yaml = serde_yaml::to_string(spec)?;
     let run_yaml_b64 = BASE64_STANDARD.encode(run_yaml.as_bytes());
@@ -544,6 +837,62 @@ fn derive_kvm_from_mode(mode: &str) -> bool {
     matches!(mode, "auto" | "kvm")
 }
 
+fn derive_kvm_for_sandbox(override_: MountKvmOverride, spec: &shim_core::RunSpec) -> bool {
+    match override_ {
+        MountKvmOverride::Auto => derive_kvm_from_mode(&spec.sandbox.mode),
+        MountKvmOverride::True => true,
+        MountKvmOverride::False => false,
+    }
+}
+
+fn read_sandbox_token(namespace: &str, sandbox_name: &str) -> Result<String, ShimError> {
+    let secret_name = format!("{sandbox_name}-token");
+    let args = [
+        "get",
+        "secret",
+        &secret_name,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={.data.token}",
+    ];
+    let output = kubectl_output(&args)?;
+    let b64 = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let bytes = BASE64_STANDARD
+        .decode(&b64)
+        .map_err(|e| ShimError::CommandFailed(format!("decode token: {e}")))?;
+    String::from_utf8(bytes).map_err(|e| ShimError::CommandFailed(format!("token not utf8: {e}")))
+}
+
+fn resolve_sandbox_endpoint(
+    namespace: &str,
+    sandbox_name: &str,
+    mode: EndpointMode,
+) -> Result<(String, Option<portforward::PortForward>), ShimError> {
+    let effective = match mode {
+        EndpointMode::Auto => {
+            if std::env::var("KUBERNETES_SERVICE_HOST").is_ok() {
+                EndpointMode::InCluster
+            } else {
+                EndpointMode::PortForward
+            }
+        }
+        other => other,
+    };
+    match effective {
+        EndpointMode::InCluster => {
+            let url = format!("http://{sandbox_name}.{namespace}.svc.cluster.local:43100");
+            Ok((url, None))
+        }
+        EndpointMode::PortForward => {
+            let pf = portforward::PortForward::open(namespace, sandbox_name, 43100)?;
+            let url = pf.url();
+            Ok((url, Some(pf)))
+        }
+        EndpointMode::Auto => unreachable!("Auto was resolved above"),
+    }
+}
+
 fn render_volumes_for_mounts(
     mounts: &[shim_core::MountSpec],
     strategy: MountStrategy,
@@ -604,9 +953,10 @@ fn validate_mount_host(host: &str) -> Result<(), ShimError> {
 
 fn validate_yaml_scalar(value: &str, field: &str) -> Result<(), ShimError> {
     if value.contains('\n') || value.contains('\r') {
-        return Err(ShimError::InvalidMount(format!(
-            "{field} must not contain newlines, got: {value:?}"
-        )));
+        return Err(ShimError::InvalidScalar(
+            field.to_string(),
+            format!("must not contain newlines, got: {value:?}"),
+        ));
     }
     Ok(())
 }
@@ -615,7 +965,13 @@ fn normalize_dns1123_label(s: &str, max_len: usize) -> String {
     let mut out: String = s
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     if out.len() > max_len {
         out.truncate(max_len);
@@ -736,8 +1092,14 @@ agent: {{ prompt: "hi", timeout_secs: 5 }}
         let spec = sample_agent_spec("kvm");
         let yaml = render_job_yaml("default", "j", &default_opts(), &spec, uuid::Uuid::nil())
             .expect("render ok");
-        assert!(yaml.contains("/dev/kvm"), "expected /dev/kvm mount; got:\n{yaml}");
-        assert!(yaml.contains("privileged: true"), "expected privileged: true; got:\n{yaml}");
+        assert!(
+            yaml.contains("/dev/kvm"),
+            "expected /dev/kvm mount; got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("privileged: true"),
+            "expected privileged: true; got:\n{yaml}"
+        );
     }
 
     #[test]
@@ -745,8 +1107,14 @@ agent: {{ prompt: "hi", timeout_secs: 5 }}
         let spec = sample_agent_spec("auto");
         let yaml = render_job_yaml("default", "j", &default_opts(), &spec, uuid::Uuid::nil())
             .expect("render ok");
-        assert!(yaml.contains("/dev/kvm"), "expected /dev/kvm for mode=auto; got:\n{yaml}");
-        assert!(yaml.contains("privileged: true"), "expected privileged for mode=auto; got:\n{yaml}");
+        assert!(
+            yaml.contains("/dev/kvm"),
+            "expected /dev/kvm for mode=auto; got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("privileged: true"),
+            "expected privileged for mode=auto; got:\n{yaml}"
+        );
     }
 
     #[test]
@@ -754,7 +1122,17 @@ agent: {{ prompt: "hi", timeout_secs: 5 }}
         let spec = sample_agent_spec("mock");
         let err = render_job_yaml("ns\ninject", "j", &default_opts(), &spec, uuid::Uuid::nil())
             .expect_err("newline in namespace should fail");
-        assert!(matches!(err, ShimError::InvalidMount(_)), "got {err:?}");
+        assert!(matches!(err, ShimError::InvalidScalar(_, _)), "got {err:?}");
+    }
+
+    #[test]
+    fn render_rejects_command_with_newline() {
+        let spec = sample_agent_spec("mock");
+        let mut opts = default_opts();
+        opts.runtime_command = "voidbox run\necho gotcha".into();
+        let err = render_job_yaml("default", "j", &opts, &spec, uuid::Uuid::nil())
+            .expect_err("newline in command should fail");
+        assert!(matches!(err, ShimError::InvalidScalar(_, _)), "got {err:?}");
     }
 
     #[test]
@@ -762,31 +1140,59 @@ agent: {{ prompt: "hi", timeout_secs: 5 }}
         let spec = sample_agent_spec("mock");
         let yaml = render_job_yaml("default", "j", &default_opts(), &spec, uuid::Uuid::nil())
             .expect("render ok");
-        assert!(!yaml.contains("/dev/kvm"), "expected no /dev/kvm; got:\n{yaml}");
-        assert!(!yaml.contains("privileged: true"), "expected no privileged; got:\n{yaml}");
+        assert!(
+            !yaml.contains("/dev/kvm"),
+            "expected no /dev/kvm; got:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("privileged: true"),
+            "expected no privileged; got:\n{yaml}"
+        );
     }
 
     #[test]
     fn render_emits_volumes_for_sandbox_mounts() {
         let mut spec = sample_agent_spec("mock");
         spec.sandbox.mounts = vec![
-            shim_core::MountSpec { host: "/tmp/a".into(), guest: "/a".into(), mode: "ro".into() },
-            shim_core::MountSpec { host: "/tmp/b".into(), guest: "/b".into(), mode: "rw".into() },
+            shim_core::MountSpec {
+                host: "/tmp/a".into(),
+                guest: "/a".into(),
+                mode: "ro".into(),
+            },
+            shim_core::MountSpec {
+                host: "/tmp/b".into(),
+                guest: "/b".into(),
+                mode: "rw".into(),
+            },
         ];
         let yaml = render_job_yaml("default", "j", &default_opts(), &spec, uuid::Uuid::nil())
             .expect("render ok");
-        assert!(yaml.contains("name: mount-0"), "mount-0 missing in:\n{yaml}");
-        assert!(yaml.contains("name: mount-1"), "mount-1 missing in:\n{yaml}");
+        assert!(
+            yaml.contains("name: mount-0"),
+            "mount-0 missing in:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("name: mount-1"),
+            "mount-1 missing in:\n{yaml}"
+        );
         assert!(yaml.contains("path: /tmp/a"), "/tmp/a missing in:\n{yaml}");
-        assert!(yaml.contains("readOnly: true"), "readOnly true missing in:\n{yaml}");
-        assert!(yaml.contains("readOnly: false"), "readOnly false missing in:\n{yaml}");
+        assert!(
+            yaml.contains("readOnly: true"),
+            "readOnly true missing in:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("readOnly: false"),
+            "readOnly false missing in:\n{yaml}"
+        );
     }
 
     #[test]
     fn render_rejects_relative_host_path() {
         let mut spec = sample_agent_spec("mock");
         spec.sandbox.mounts = vec![shim_core::MountSpec {
-            host: "rel/path".into(), guest: "/a".into(), mode: "ro".into(),
+            host: "rel/path".into(),
+            guest: "/a".into(),
+            mode: "ro".into(),
         }];
         let err = render_job_yaml("default", "j", &default_opts(), &spec, uuid::Uuid::nil())
             .expect_err("relative path should fail");
@@ -798,8 +1204,10 @@ agent: {{ prompt: "hi", timeout_secs: 5 }}
         let spec = sample_agent_spec("mock");
         let yaml = render_job_yaml("default", "j", &default_opts(), &spec, uuid::Uuid::nil())
             .expect("render ok");
-        assert!(yaml.contains("voidbox run --file /spec/run.yaml"),
-            "default command missing or wrong; got:\n{yaml}");
+        assert!(
+            yaml.contains("voidbox run --file /spec/run.yaml"),
+            "default command missing or wrong; got:\n{yaml}"
+        );
     }
 
     #[test]

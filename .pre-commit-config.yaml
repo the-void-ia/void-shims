@@ -1,0 +1,43 @@
+# Pre-commit hooks for void-shims.
+#
+# Install once: `pip install pre-commit && pre-commit install`
+# Run manually: `pre-commit run --all-files`
+#
+# These local hooks shell out to cargo so they stay in lockstep with CI
+# (.github/workflows/ci.yml). If a hook is too slow on every commit,
+# move it to `pre-push` by editing the install: `pre-commit install -t pre-push`.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy -D warnings
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test --workspace
+        entry: cargo test --workspace
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]  # slow; only on push, not every commit
