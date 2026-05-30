@@ -1,0 +1,14 @@
+api_version: v1
+kind: agent
+name: smoke-svc
+sandbox:
+  mode: mock
+  memory_mb: 512
+  vcpus: 1
+llm:
+  provider: claude
+  model: claude-haiku-4-5-20251001
+agent:
+  prompt: "You are an echo agent. Reply to every message with exactly the user's message text, no preamble."
+  mode: service
+  output_file: /workspace/output.json

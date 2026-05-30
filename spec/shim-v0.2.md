@@ -11,17 +11,22 @@ A shim is an integration adapter that allows an external orchestrator
 (e.g. Kubernetes, containerd, libvirt) to execute Void-Box without
 adopting void-control.
 
-Shims must remain thin: - Map a RunSpec to an external primitive (Job /
-Task / Domain) - Expose logs and status using the platform's idioms -
-Avoid implementing full control-plane features
+Shims must remain thin:
+
+- Map a RunSpec to an external primitive (Job / Task / Domain)
+- Expose logs and status using the platform's idioms
+- Avoid implementing full control-plane features
 
 ------------------------------------------------------------------------
 
 ## 2. Non-Goals
 
-A shim MUST NOT: - Implement distributed scheduling - Implement durable
-desired/observed reconciliation - Orchestrate stages as first-class
-resources - Provide multi-run fairness beyond simple limits
+A shim MUST NOT:
+
+- Implement distributed scheduling
+- Implement durable desired/observed reconciliation
+- Orchestrate stages as first-class resources
+- Provide multi-run fairness beyond simple limits
 
 Those responsibilities belong to void-control.
 
@@ -53,18 +58,23 @@ Shims must return a RunRef:
 -   containerd: namespace/task_id
 -   libvirt: domain_name
 
-They must expose: - status (Pending / Running / Succeeded / Failed /
-Unknown) - exit code when possible - logs (best effort)
+They must expose:
+
+- status (Pending / Running / Succeeded / Failed / Unknown)
+- exit code when possible
+- logs (best effort)
 
 ------------------------------------------------------------------------
 
 ## 5. CLI Contract (Recommended)
 
-void-shim-`<target>`{=html} run --file \<spec.yaml\>
-void-shim-`<target>`{=html} status `<run_ref>`{=html}
-void-shim-`<target>`{=html} logs `<run_ref>`{=html} \[--follow\]
-void-shim-`<target>`{=html} rm `<run_ref>`{=html}
-void-shim-`<target>`{=html} render --file \<spec.yaml\>
+```
+void-shim-<target> run    --file <spec.yaml>
+void-shim-<target> status <run_ref>
+void-shim-<target> logs   <run_ref> [--follow]
+void-shim-<target> rm     <run_ref>
+void-shim-<target> render --file <spec.yaml>
+```
 
 ------------------------------------------------------------------------
 
@@ -85,13 +95,28 @@ as failures.
 
 ### 7.1 void-shim-k8s (MVP Target)
 
-Primitive: - Kubernetes Job
+Primitive:
 
-Requirements: - privileged execution if KVM required - mount /dev/kvm if
-needed - provide workflow spec via ConfigMap, PVC, or mount
+- Kubernetes Job (`batch/v1`)
+- Kubernetes Sandbox (`agents.x-k8s.io/v1alpha1`) for `kind: agent, mode: service`
 
-Status mapping: - Job Active -\> Running - Job Succeeded -\> Succeeded -
-Job Failed -\> Failed
+Requirements:
+
+- privileged execution if KVM required
+- mount `/dev/kvm` if needed
+- provide RunSpec to the daemon via a mounted `Secret`
+
+Status mapping (Job):
+
+- Job Active → Running
+- Job Succeeded → Succeeded
+- Job Failed → Failed
+
+Status mapping (Sandbox):
+
+- `.status.conditions[Ready].status == "True"` → Running
+- `.status.conditions[Ready].status == "False"` → Pending
+- (anything else) → Unknown
 
 Auto-derivation:
 - `securityContext.privileged` and `/dev/kvm` mount are auto-derived from
@@ -105,18 +130,30 @@ Auto-derivation:
 
 ### 7.2 void-shim-containerd (Later)
 
-Primitive: - containerd task (runtime v2)
+Primitive:
 
-MVP: - Execute void-box run - Return correct exit code - Basic stdout
-streaming
+- containerd task (runtime v2)
+
+MVP:
+
+- Execute `voidbox run`
+- Return correct exit code
+- Basic stdout streaming
 
 ------------------------------------------------------------------------
 
 ### 7.3 void-shim-libvirt (Later)
 
-Primitive: - libvirt domain
+Primitive:
 
-MVP: - Create domain - Start VM - Wait for exit - Capture console output
+- libvirt domain
+
+MVP:
+
+- Create domain
+- Start VM
+- Wait for exit
+- Capture console output
 
 ------------------------------------------------------------------------
 
@@ -129,9 +166,19 @@ must be enforced strictly.
 
 ## 9. Repository Layout (Mono-repo Recommended)
 
-void-shims/ ├── spec/ │ └── shim-v0.2.md ├── crates/ │ ├── shim-core/ │
-├── shim-k8s/ │ ├── shim-containerd/ │ └── shim-libvirt/ ├── scripts/ │ └──
-kind_smoke.sh └── README.md
+```
+void-shims/
+├── spec/
+│   └── shim-v0.2.md
+├── crates/
+│   ├── shim-core/
+│   ├── shim-k8s/
+│   ├── shim-containerd/
+│   └── shim-libvirt/
+├── scripts/
+│   └── kind_smoke.sh
+└── README.md
+```
 
 ------------------------------------------------------------------------
 
@@ -175,11 +222,11 @@ CI integration tracked separately in §11.7.
 
 ### 11.6 agent-sandbox CRD Backend
 
-Add a second renderer for the kubernetes-sigs `agents.x-k8s.io/v1beta1`
-`Sandbox` CRD, for specs with `kind: agent, mode: service|interactive` or
-`kind: sandbox` where long-running pods with suspend/resume semantics are
-the right model. Selector flag: `--backend job|sandbox|auto`. Tracked in a
-separate design doc.
+Done in v0.2 (for `kind: agent, mode: service`): renderer for the
+kubernetes-sigs `agents.x-k8s.io/v1alpha1` `Sandbox` CRD with
+`--backend job|sandbox|auto` selector. Remaining: support
+`mode: interactive` and `kind: sandbox` (bare VM) via the same backend;
+migrate to `v1beta1` when the agent-sandbox release exposes it.
 
 ### 11.7 CI Workflow
 
