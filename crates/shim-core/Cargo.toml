@@ -1,0 +1,10 @@
+[package]
+name = "shim-core"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+void-box = { path = "../../../agent-infra/void-box" }
+serde_yaml = "0.9"
+thiserror = "1"
